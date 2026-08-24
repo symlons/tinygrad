@@ -60,6 +60,7 @@ class NVDriver(VirtDriver):
 
     self.object_by_handle = {}
     self.opened_fds = {}
+    self.attached_gpus: set[int] = set()
     self.next_doorbell = collections.defaultdict(int)
     self._executing = False  # re-entrancy guard for _gpu_mmio_write
 
@@ -91,6 +92,9 @@ class NVDriver(VirtDriver):
     elif struct.hClass == nv_gpu.NV01_DEVICE_0:
       params:Any = nv_gpu.NV0080_ALLOC_PARAMETERS.from_address(params_ptr)
       assert params.hClientShare == self.root_handle
+      if params.deviceId not in self.attached_gpus:
+        struct.status = nv_gpu.NV_ERR_INSUFFICIENT_PERMISSIONS
+        return 0
       struct.hObjectNew = self._alloc_handle()
       self.object_by_handle[struct.hObjectNew] = self.gpus[params.deviceId]
     elif struct.hClass == nv_gpu.NV20_SUBDEVICE_0:
@@ -147,7 +151,10 @@ class NVDriver(VirtDriver):
   def rm_control(self, argp):
     struct = nv_gpu.NVOS54_PARAMETERS.from_address(argp)
     params_ptr = cast(int, struct.params)
-    if struct.cmd == nv_gpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:
+    if struct.cmd == nv_gpu.NV0000_CTRL_CMD_GPU_ATTACH_IDS:
+      attach_params = nv_gpu.NV0000_CTRL_GPU_ATTACH_IDS_PARAMS.from_address(params_ptr)
+      self.attached_gpus.update(int(gpu_id) for gpu_id in attach_params.gpuIds if gpu_id != nv_gpu.NV0000_CTRL_GPU_INVALID_ID)
+    elif struct.cmd == nv_gpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:
       params:Any = nv_gpu.NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS.from_address(params_ptr)
       params.deviceInstance = params.gpuId # emulate them to be the same
     elif struct.cmd == nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2 or struct.cmd == nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST:

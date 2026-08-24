@@ -7,7 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, DEV
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
@@ -31,6 +31,23 @@ class NVSignal(HCQSignal):
 
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
+def _accessible_gpu_minors() -> list[int]:
+  minors:list[int] = []
+  for name in os.listdir("/dev"):
+    if not re.fullmatch(r"nvidia\d+", name): continue
+    try: fd = os.open(f"/dev/{name}", os.O_RDWR | os.O_CLOEXEC)
+    except OSError: continue
+    os.close(fd)
+    minors.append(int(name.removeprefix("nvidia")))
+  return sorted(minors)
+
+def _smem_config(qmd_version:int, usage:int) -> tuple[int, int]:
+  confs, target_ctas = (([32, 64, 100, 132, 164], 3) if qmd_version == 2 else ([32, 64, 100], 2))
+  if usage > confs[-1] * 1024: raise RuntimeError(f"Too much shared memory requested: {usage} bytes")
+  target = min(usage * target_ctas, confs[-1] * 1024)
+  config = min(x * 1024 for x in confs if x * 1024 >= target) // 4096 + 1
+  return config, confs[-1] * 1024 // 4096 + 1
+
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
 NV_PFAULT_ACCESS_TYPE = {dt:name.split("_")[-1] for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_ACCESS_TYPE_")}
 
@@ -45,10 +62,12 @@ class QMD:
   fields: dict[str, dict[str, tuple[int, int]]] = {}
 
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
-    self.ver, self.sz = (5, 0x60) if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else (3, 0x40)
+    self.ver, self.sz = ((5, 0x60) if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else
+                         (2, 0x40) if dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A else (3, 0x40))
 
     # Init fields from module
-    if (pref:="NVCEC0_QMDV05_00" if self.ver == 5 else "NVC6C0_QMDV03_00") not in QMD.fields:
+    pref = "NVCEC0_QMDV05_00" if self.ver == 5 else "NVC6C0_QMDV02_04" if self.ver == 2 else "NVC6C0_QMDV03_00"
+    if pref not in QMD.fields:
       QMD.fields[pref] = {**{name[len(pref)+1:]: dt for name,dt in nv_gpu.__dict__.items() if name.startswith(pref) and isinstance(dt, tuple)},
         **{name[len(pref)+1:]+f"_{i}": dt(i) for name,dt in nv_gpu.__dict__.items() for i in range(8) if name.startswith(pref) and callable(dt)}}
 
@@ -159,16 +178,19 @@ class NVComputeQueue(NVCommandQueue):
   def signal(self, signal:HCQSignal, value:sint=0):
     if self.active_qmd is not None:
       for i in range(2):
-        if self.active_qmd.read(f'release{i}_enable') == 0:
-          self.active_qmd.write(**{f'release{i}_enable': 1})
+        enable_field = f'semaphore_release_enable{i}' if self.active_qmd.ver == 2 else f'release{i}_enable'
+        if self.active_qmd.read(enable_field) == 0:
+          self.active_qmd.write(**{enable_field: 1})
 
           addr_off = self.active_qmd.field_offset(f'release{i}_address_lower' if self.active_qmd.ver<4 else f'release_semaphore{i}_addr_lower')
           self.bind_sints_to_mem(signal.value_addr & 0xffffffff, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=addr_off)
           self.bind_sints_to_mem(signal.value_addr >> 32, mem=self.active_qmd_buf.cpu_view(), fmt='I', mask=0xf, offset=addr_off+4)
 
-          val_off = self.active_qmd.field_offset(f'release{i}_payload_lower' if self.active_qmd.ver<4 else f'release_semaphore{i}_payload_lower')
+          val_field = f'release{i}_payload' if self.active_qmd.ver == 2 else \
+                      f'release{i}_payload_lower' if self.active_qmd.ver<4 else f'release_semaphore{i}_payload_lower'
+          val_off = self.active_qmd.field_offset(val_field)
           self.bind_sints_to_mem(value & 0xffffffff, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=val_off)
-          self.bind_sints_to_mem(value >> 32, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=val_off+4)
+          if self.active_qmd.ver != 2: self.bind_sints_to_mem(value >> 32, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=val_off+4)
           return self
 
     self.nvm(0, nv_gpu.NVC56F_SEM_ADDR_LO, *data64_le(signal.value_addr), *data64_le(value),
@@ -261,9 +283,11 @@ class NVProgram(HCQProgram['NVDevice']):
     if not NAK:
       # For MOCKGPU, the lib is PTX code, so some values are emulated.
       self.regs_usage, self.shmem_usage, self.lcmem_usage, cbuf0_size = 0, 0x400, 0x240, 0x160 if isinstance(dev.iface, MOCKIface) else 0
+      found_program = isinstance(dev.iface, MOCKIface)
       for sh in sections: # pylint: disable=possibly-used-before-assignment
         if sh.name == f".nv.shared.{self.name}": self.shmem_usage = round_up(0x400 + sh.header.sh_size, 128)
-        if sh.name == f".text.{self.name}": prog_addr, prog_sz = self.lib_gpu.va_addr+sh.header.sh_addr, sh.header.sh_size
+        if sh.name == f".text.{self.name}":
+          prog_addr, prog_sz, found_program = self.lib_gpu.va_addr+sh.header.sh_addr, sh.header.sh_size, True
         elif m:=re.match(r'\.nv\.constant(\d+)', sh.name):
           self.constbufs[int(m.group(1))] = (self.lib_gpu.va_addr+sh.header.sh_addr, sh.header.sh_size)
         elif sh.name.startswith(".nv.info"):
@@ -271,6 +295,8 @@ class NVProgram(HCQProgram['NVDevice']):
             if sh.name == f".nv.info.{obj.name}" and param == 0xa: cbuf0_size = struct.unpack_from("IH", data)[1] # EIATTR_PARAM_CBANK
             elif sh.name == ".nv.info" and param == 0x12: self.lcmem_usage = struct.unpack_from("II", data)[1] + 0x240 # EIATTR_MIN_STACK_SIZE
             elif sh.name == ".nv.info" and param == 0x2f: self.regs_usage = struct.unpack_from("II", data)[1] # EIATTR_REGCOUNT
+
+      if not found_program: raise RuntimeError(f"Kernel {self.name!r} was not found in the compiled NV binary")
 
       # Apply relocs
       for apply_image_offset, rel_sym_offset, typ, _ in relocs: # pylint: disable=possibly-used-before-assignment
@@ -284,6 +310,8 @@ class NVProgram(HCQProgram['NVDevice']):
       min_cbuf0_entries = 224 if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else 12
       self.cbuf_0 = [0] * max(cbuf0_size // 4, min_cbuf0_entries)
 
+    self.shmem_usage += obj.shared_mem
+
     # Ensure device has enough local memory to run the program
     self.dev._ensure_has_local_memory(self.lcmem_usage)
     self.dev.allocator._copyin(self.lib_gpu, image)
@@ -296,16 +324,21 @@ class NVProgram(HCQProgram['NVDevice']):
         f'shader_local_memory_{"low" if NAK else "high"}_size_shifted4': self.dev.slm_per_thread>>4}
     else:
       if not NAK: self.cbuf_0[6:12] = [*data64_le(self.dev.shared_mem_window), *data64_le(self.dev.local_mem_window), *data64_le(0xfffdc0)]
-      qmd = {'qmd_major_version':3, 'sm_global_caching_enable':1, 'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
+      qmd = {'qmd_major_version':dev.qmd_version, 'sm_global_caching_enable':1,
+        'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
         'shared_memory_size':self.shmem_usage, 'register_count_v':self.regs_usage,
         f'shader_local_memory_{"low" if NAK else "high"}_size':self.dev.slm_per_thread}
+      if dev.qmd_version == 2: qmd['qmd_version'] = 4
 
-    smem_cfg = min(shmem_conf * 1024 for shmem_conf in [32, 64, 100] if shmem_conf * 1024 >= self.shmem_usage) // 4096 + 1
+    # Target enough shared memory for multiple resident CTAs when possible. Picking only
+    # the smallest configuration that fits one CTA leaves staged GEMMs at one CTA per SM.
+    # GA100 supports the larger 132/164 KiB carveouts and can fit three 49 KiB GEMM CTAs.
+    smem_cfg, max_smem_cfg = _smem_config(dev.qmd_version, self.shmem_usage)
 
     self.qmd:QMD = QMD(dev, **qmd, qmd_group_id=0x3f, invalidate_texture_header_cache=1, invalidate_texture_sampler_cache=1,
       invalidate_texture_data_cache=1, invalidate_shader_data_cache=1, api_visible_call_limit=1, sampler_index=1, barrier_count=1,
       cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, constant_buffer_invalidate_0=1, min_sm_config_shared_mem_size=smem_cfg,
-      target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1a, program_prefetch_size=min(prog_sz>>8, 0x1ff),
+      target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=max_smem_cfg, program_prefetch_size=min(prog_sz>>8, 0x1ff),
       sass_version=dev.sass_version, program_prefetch_addr_upper_shifted=prog_addr>>40, program_prefetch_addr_lower_shifted=prog_addr>>8)
 
     for i,(addr,sz) in self.constbufs.items():
@@ -371,6 +404,7 @@ class NVKIface:
   root = None
   fd_ctl: FileIOInterface
   fd_uvm: FileIOInterface
+  gpu_minors: list[int] = []
   count: int
   gpus_info: list|ctypes.Array = []
 
@@ -390,9 +424,18 @@ class NVKIface:
       self.fd_uvm_2 = FileIOInterface("/dev/nvidia-uvm", os.O_RDWR | os.O_CLOEXEC)
       NVKIface.root = self.rm_alloc(0, nv_gpu.NV01_ROOT_CLIENT, None, root=0)
 
-      drvver = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2, nv_gpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS())
-      if int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 610: nv_gpu = nv_610
-      elif int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 580: nv_gpu = nv_580
+      try:
+        drvver = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2,
+                                 nv_gpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS())
+        drv_major = int(drvver.driverVersionBuffer.decode().split('.')[0], 10)
+      except RuntimeError:
+        # Some RM proxies reject the build-version control, but still support the kernel ioctl used by libcuda.
+        version_query = nv_gpu.nv_ioctl_rm_api_version_t(cmd=ord(nv_gpu.NV_RM_API_VERSION_CMD_QUERY))
+        nv_iowr(NVKIface.fd_ctl, nv_gpu.NV_ESC_CHECK_VERSION_STR, version_query)
+        if version_query.reply != nv_gpu.NV_RM_API_VERSION_REPLY_RECOGNIZED: raise
+        drv_major = int(bytes(version_query.versionString).split(b'.')[0], 10)
+      if drv_major >= 610: nv_gpu = nv_610
+      elif drv_major >= 580: nv_gpu = nv_580
 
       self.uvm(nv_gpu.UVM_INITIALIZE, nv_gpu.UVM_INITIALIZE_PARAMS())
 
@@ -400,17 +443,27 @@ class NVKIface:
       with contextlib.suppress(RuntimeError): self.uvm(nv_gpu.UVM_MM_INITIALIZE, nv_gpu.UVM_MM_INITIALIZE_PARAMS(uvmFd=self.fd_uvm.fd), self.fd_uvm_2)
 
       nv_iowr(NVKIface.fd_ctl, nv_gpu.NV_ESC_CARD_INFO, gpus_info:=(nv_gpu.nv_ioctl_card_info_t*64)())
-      NVKIface.gpus_info = hcq_filter_visible_devices([gi for gi in gpus_info if gi.valid], "NV")
+      card_infos = [gi for gi in gpus_info if gi.valid]
+      # RM proxies can return every host GPU even when only a subset of device nodes is accessible to the container.
+      NVKIface.gpu_minors = [int(gi.gpu_id) for gi in card_infos] if DEV.interface.startswith("MOCK") else _accessible_gpu_minors()
+      if accessible := [gi for gi in card_infos if int(gi.minor_number) in NVKIface.gpu_minors]: card_infos = accessible
+      NVKIface.gpus_info = hcq_filter_visible_devices(card_infos, "NV")
       NVKIface.count = len(NVKIface.gpus_info)
+
+      for gi in NVKIface.gpus_info:
+        gpu_ids = [nv_gpu.NV0000_CTRL_GPU_INVALID_ID] * 32
+        gpu_ids[0] = int(gi.gpu_id)
+        self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_GPU_ATTACH_IDS,
+                        nv_gpu.NV0000_CTRL_GPU_ATTACH_IDS_PARAMS(gpuIds=(nv_gpu.NvU32 * 32)(*gpu_ids)))
 
     self.dev, self.device_id = dev, device_id
     if self.device_id >= len(NVKIface.gpus_info) or not NVKIface.gpus_info[self.device_id].valid:
       raise RuntimeError(f"No device found for {device_id}. Requesting more devices than the system has?")
 
+    self.gpu_minor = self._get_gpu_minor()
     self.fd_dev = self._new_gpu_fd()
     self.gpu_info = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
       nv_gpu.NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS(gpuId=NVKIface.gpus_info[self.device_id].gpu_id))
-    self.gpu_minor = NVKIface.gpus_info[self.device_id].minor_number
     self.gpu_instance = self.gpu_info.deviceInstance
 
   def rm_alloc(self, parent, clss, params=None, root=None) -> int:
@@ -438,8 +491,9 @@ class NVKIface:
     self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
     self.usermode_class:int = next(c for c in [nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A] if c in self.nvclasses)
     self.gpfifo_class:int = next(c for c in [nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A] if c in self.nvclasses)
-    self.compute_class:int = next(c for c in [nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B] if c in self.nvclasses)
-    self.dma_class:int = next(c for c in [nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B] if c in self.nvclasses)
+    self.compute_class:int = next(c for c in [nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_COMPUTE_A]
+                                   if c in self.nvclasses)
+    self.dma_class:int = next(c for c in [nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_A] if c in self.nvclasses)
     self.viddec_class:int|None = next((c for c in [nv_gpu.NVCFB0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER] if c in self.nvclasses), None)
 
     usermode = self.rm_alloc(self.dev.subdevice, self.usermode_class)
@@ -463,9 +517,16 @@ class NVKIface:
       hChannel=gpfifo, base=self._alloc_gpu_vaddr(0x4000000, force_low=True), length=0x4000000))
 
   def _new_gpu_fd(self):
-    fd_dev = FileIOInterface(f"/dev/nvidia{NVKIface.gpus_info[self.device_id].minor_number}", os.O_RDWR | os.O_CLOEXEC)
+    fd_dev = FileIOInterface(f"/dev/nvidia{self.gpu_minor}", os.O_RDWR | os.O_CLOEXEC)
     nv_iowr(fd_dev, nv_gpu.NV_ESC_REGISTER_FD, nv_gpu.nv_ioctl_register_fd_t(ctl_fd=self.fd_ctl.fd))
     return fd_dev
+
+  def _get_gpu_minor(self) -> int:
+    reported = int(NVKIface.gpus_info[self.device_id].minor_number)
+    if reported in NVKIface.gpu_minors: return reported
+    if len(NVKIface.gpu_minors) == len(NVKIface.gpus_info): return NVKIface.gpu_minors[self.device_id]
+    if len(NVKIface.gpu_minors) == 1: return NVKIface.gpu_minors[0]
+    raise RuntimeError(f"Cannot map GPU {self.device_id} to a device node (reported minor {reported}, exposed minors {NVKIface.gpu_minors})")
 
   def _gpu_map_to_cpu(self, memory_handle, size, target=None, flags=0, system=False):
     fd_dev = self._new_gpu_fd() if not system else FileIOInterface("/dev/nvidiactl", os.O_RDWR | os.O_CLOEXEC)
@@ -626,10 +687,13 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info('num_gpcs',
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
+    self.qmd_version = (2 if self.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A else
+                        5 if self.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else 3)
 
     # FIXME: no idea how to convert this for blackwells
-    self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
-    self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
+    self.arch: str = "sm_120" if self.sm_version==0xa04 else "sm_80" if self.sm_version==0x802 else \
+      f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+    self.sass_version = 0x80 if self.sm_version==0x802 else ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], NVProgram, NVSignal, NVComputeQueue,
                      NVCopyQueue, arch=self.arch)
