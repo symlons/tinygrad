@@ -1,6 +1,6 @@
 # A100 NV backend + GEMM kernel — change summary
 
-Four commits, in order. Each is independently motivated; later ones build on earlier ones.
+Five commits, in order. Each is independently motivated; later ones build on earlier ones.
 
 ## 1. `nv: Ampere GA100 (A100) QMD-v2 support`
 
@@ -64,17 +64,30 @@ in every sample observed, but not a documented driver guarantee. If that assumpt
 breaks on some platform, this fails silently (wrong GPU, or a confusing downstream error).
 See the script's own header comment for detail.
 
-## Related, not fixed here
+## 5. `nv: populate blockDim/gridDim launch ABI for hand-written kernels`
 
-While building the GEMM kernel's persistent-CTA variant, a custom `.cu` kernel reading
-`gridDim.x`/`blockDim.x` directly (not through tinygrad's own codegen) got back `0`.
-Root-caused via SASS disassembly (`nvcc`/`cuobjdump`, no GPU needed): `blockIdx`/`threadIdx`
-are true hardware `S2R` special registers, but `blockDim`/`gridDim` are loads from a fixed
-region of constant bank 0 (`c[0x0][0x0]`–`c[0x0][0x14]`) that the real CUDA driver's
-`cuLaunchKernel` populates as part of its launch ABI — `NVProgram`'s direct HCQ launch path
-never writes that region. Not exercised by tinygrad's own kernels (which never reference
-`gridDim`/`blockDim`), so invisible to its test suite; only hits hand-written kernels using
-those builtins directly. Fix location identified (`NVComputeQueue.exec()` needs to write
-`local_size`/`global_size` into that constant-bank region per launch) but not implemented.
-Current workaround in `nv_bf16_gemm.py`: bake the CTA count as a compile-time `#define`
-instead of reading `gridDim.x` at runtime.
+**Problem:** while building the GEMM kernel's persistent-CTA variant, a custom `.cu` kernel
+reading `gridDim.x`/`blockDim.x` directly (not through tinygrad's own codegen) got back `0`
+and hung a grid-stride loop. Root-caused via real SASS disassembly (`nvcc`/`cuobjdump` for
+`sm_80`, no GPU needed): `blockIdx`/`threadIdx` are true hardware `S2R` special registers,
+populated by the CTA-distributor from the QMD regardless of constant bank contents —
+that's why indexing via `blockIdx`/`threadIdx` (what tinygrad's own generated kernels use)
+always worked. `blockDim`/`gridDim` are *not* S2R: ptxas compiles them as plain loads from
+`c[0x0][0x0]` (blockDim) and `c[0x0][0xc]` (gridDim) — a launch-ABI region the real CUDA
+driver's `cuLaunchKernel` populates automatically as part of every launch, which
+`NVProgram`'s direct HCQ launch path never wrote. Invisible to tinygrad's own kernels/test
+suite, since `CUDARenderer` only ever emits `blockIdx`/`threadIdx`, never `gridDim`/
+`blockDim` — only hand-written kernels using those CUDA builtins directly hit this.
+
+**Fix:** write `local_size`/`global_size` into the constant-bank-0 region per launch in
+`NVComputeQueue.exec()`, the same `bind_sints_to_mem` pattern already used for the QMD's
+own raster/thread-dimension fields, gated to non-NAK (ELF/PTX-compiled) kernels since
+NAK's launch ABI is unrelated to this constant-bank convention. Verified end-to-end under
+MOCKGPU: builds a real `NVProgram`, execs it, and confirms the constant-bank bytes match
+`local_size`/`global_size` exactly.
+
+**Not yet done:** `nv_bf16_gemm.py`'s persistent-kernel path still bakes the CTA count as a
+compile-time `#define` instead of reading `gridDim.x` at runtime (the workaround that
+predates this fix). Now that `gridDim` is populated correctly, that workaround could be
+replaced with a real `gridDim.x` read — left as-is here since it isn't broken, just no
+longer strictly necessary.
