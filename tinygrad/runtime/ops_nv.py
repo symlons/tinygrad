@@ -155,6 +155,18 @@ class NVComputeQueue(NVCommandQueue):
     self.bind_sints_to_mem(local_size[2], mem=qmd_buf.cpu_view(), fmt='B', offset=qmd.field_offset('cta_thread_dimension2'))
     qmd.set_constant_buf_addr(0, args_state.buf.va_addr)
 
+    if not isinstance(prg.dev.renderer, NAKRenderer):
+      # blockIdx/threadIdx are hardware S2R special registers, populated by the CTA-distributor
+      # from the QMD raster/thread-dimension fields above regardless of what's in constant bank 0.
+      # blockDim/gridDim are NOT S2R: ptxas compiles them as plain loads from c[0x0][0x0] (blockDim)
+      # and c[0x0][0xc] (gridDim) -- a launch-ABI region the real CUDA driver's cuLaunchKernel
+      # populates automatically, but this direct HCQ launch path otherwise never writes. Only
+      # matters for hand-written kernels that reference gridDim/blockDim directly (tinygrad's own
+      # generated kernels never do), and only for the ELF/PTX-compiled path -- NAK's launch ABI is
+      # unrelated to this constant-bank convention.
+      self.bind_sints_to_mem(*local_size[:3], mem=args_state.buf.cpu_view(), fmt='I', offset=0x0)
+      self.bind_sints_to_mem(*global_size[:3], mem=args_state.buf.cpu_view(), fmt='I', offset=0xc)
+
     if self.active_qmd is None:
       if prg.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
       self.nvm(1, nv_gpu.NVC6C0_SEND_PCAS_A, qmd_buf.va_addr >> 8)

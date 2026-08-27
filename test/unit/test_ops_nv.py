@@ -55,4 +55,23 @@ class TestNVDynamicSharedMemory(unittest.TestCase):
     self.assertEqual(prog.qmd.read("shared_memory_size"), 0x400)
 
 
+@unittest.skipUnless(DEV.interface == "MOCK" and DEV.device == "NV", "Testing NV mockgpu")
+class TestNVBlockDimGridDim(unittest.TestCase):
+  # blockIdx/threadIdx are hardware S2R registers (populated from the QMD regardless of constant
+  # bank contents), but blockDim/gridDim are plain loads from c[0x0][0x0]/c[0x0][0xc] -- a launch-ABI
+  # region the real CUDA driver populates that this direct HCQ launch path otherwise never writes.
+  # Confirmed via real nvcc/cuobjdump SASS disassembly for sm_80 that this is the actual mechanism.
+  def test_blockdim_griddim_reach_constant_bank(self):
+    from tinygrad import Device
+    from tinygrad.device import TinyELF, Target
+    from tinygrad.runtime.ops_nv import NVProgram, NVComputeQueue
+    obj = TinyELF(lib=b"\x00" * 4, name="test_griddim_kernel", target=Target(), signature=())
+    prg = NVProgram(Device["NV"], obj)
+    args_state = prg.fill_kernargs(bufs=(), vals=())
+    NVComputeQueue().exec(prg, args_state, global_size=(4, 2, 1), local_size=(32, 4, 1))
+    mv = args_state.buf.cpu_view()
+    self.assertEqual(tuple(mv.view(offset=0x0, size=12, fmt='I')), (32, 4, 1))  # blockDim == local_size
+    self.assertEqual(tuple(mv.view(offset=0xc, size=12, fmt='I')), (4, 2, 1))   # gridDim == global_size
+
+
 if __name__ == "__main__": unittest.main()
