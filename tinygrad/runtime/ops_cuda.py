@@ -36,7 +36,7 @@ def cu_time_execution(cb, enable=False) -> float|None:
 
 class CUDAProgram(Program['CUDADevice']):
   def __init__(self, dev:CUDADevice, obj:TinyELF, smem:int=0):
-    self.dev, self.name, self.lib, self.signature, self.smem = dev, obj.name, obj.lib, obj.signature, smem
+    self.dev, self.name, self.lib, self.signature, self.smem = dev, obj.name, obj.lib, obj.signature, max(smem, obj.dynamic_smem)
     if DEBUG >= 5: print("\n".join([f"{i+1:>3} {line}" for i, line in enumerate(pretty_ptx(obj.lib.decode('utf-8')).split("\n"))]))
 
     check(cuda.cuCtxSetCurrent(self.dev.context))

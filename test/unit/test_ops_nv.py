@@ -1,6 +1,7 @@
 import unittest
 from typing import Any, cast
 
+from tinygrad.helpers import DEV
 from tinygrad.runtime.ops_nv import QMD, _smem_config, nv_gpu
 
 
@@ -30,6 +31,28 @@ class TestNVQMD(unittest.TestCase):
     self.assertEqual(_smem_config(2, 0x400 + 49152), (42, 42))  # GA100: target three CTAs in 164 KiB
     self.assertEqual(_smem_config(3, 0x400 + 49152), (26, 26))  # other GPUs: target two CTAs in 100 KiB
     with self.assertRaisesRegex(RuntimeError, "Too much shared memory"): _smem_config(2, 165 * 1024)
+
+
+@unittest.skipUnless(DEV.interface == "MOCK" and DEV.device == "NV", "Testing NV mockgpu")
+class TestNVDynamicSharedMemory(unittest.TestCase):
+  # end-to-end: a kernel's declared dynamic_smem must actually reach the QMD's shared_memory_size
+  # field NVProgram writes to the GPU, not just survive the KernelInfo -> TinyELF dataclass hops.
+  def _build(self, dynamic_smem:int):
+    from tinygrad import Device
+    from tinygrad.device import TinyELF, Target
+    from tinygrad.runtime.ops_nv import NVProgram
+    obj = TinyELF(lib=b"\x00" * 4, name="test_dynamic_smem_kernel", target=Target(), signature=(), dynamic_smem=dynamic_smem)
+    return NVProgram(Device["NV"], obj)
+
+  def test_dynamic_smem_reaches_qmd(self):
+    prog = self._build(73728)
+    self.assertEqual(prog.shmem_usage, 0x400 + 73728)  # 0x400 = NVIDIA's documented 1 KiB reserved-per-block carveout
+    self.assertEqual(prog.qmd.read("shared_memory_size"), prog.shmem_usage)
+
+  def test_no_dynamic_smem_is_unaffected(self):
+    prog = self._build(0)
+    self.assertEqual(prog.shmem_usage, 0x400)
+    self.assertEqual(prog.qmd.read("shared_memory_size"), 0x400)
 
 
 if __name__ == "__main__": unittest.main()

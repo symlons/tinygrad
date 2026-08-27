@@ -300,6 +300,8 @@ class NVProgram(HCQProgram['NVDevice']):
       min_cbuf0_entries = 224 if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else 12
       self.cbuf_0 = [0] * max(cbuf0_size // 4, min_cbuf0_entries)
 
+    self.shmem_usage += obj.dynamic_smem
+
     # Ensure device has enough local memory to run the program
     self.dev._ensure_has_local_memory(self.lcmem_usage)
     self.dev.allocator._copyin(self.lib_gpu, image)

@@ -328,6 +328,7 @@ class TinyELF:
   # tuple of (name, slot, dtype, shape)
   signature: tuple[tuple[str|None, int, DType, tuple], ...]
   profile_key: bytes|None = None
+  dynamic_smem: int = 0 # bytes of dynamic (extern __shared__) memory the kernel needs, on top of any statically-declared shared memory
 
   @staticmethod
   def iter_sig(signature:tuple[tuple[str|None, int, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
